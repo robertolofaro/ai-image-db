@@ -67,6 +67,14 @@ python -m ai_image_db.cli --db my_images.db caption 1 2 3
 
 # Caption everything that still has no caption
 python -m ai_image_db.cli --db my_images.db caption --all
+
+# using local models instead of huggingface:
+python -m ai_image_db.cli --db <DATABASEPATH>.db caption --all \
+  --florence <MODELPATH>/Florence-2-base \
+  --wd <MODELPATH>/wd-v1-4-vit-tagger-v2 \
+  --local-only
+
+If you receive and error <code>forced_bos_token_id</code>, it is an incompatibility with the latest transformer versions: <code>pip install 'transformers>=4.41.0,<4.50'</code>
 ```
 
 ### 3. Audit an external image (Art. 50 oriented)
