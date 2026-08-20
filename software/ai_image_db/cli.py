@@ -1,5 +1,5 @@
 """
-Command-line interface for the ai-image-db.
+Command-line interface for the AI Image Provenance toolkit.
 """
 
 from __future__ import annotations
@@ -61,14 +61,44 @@ def load_cmd(ctx, paths, recursive, no_c2pa, no_wm, error_csv):
 @main.command("caption")
 @click.argument("image_ids", nargs=-1, type=int)
 @click.option("--all", "do_all", is_flag=True, help="Caption every image that has no caption yet")
-@click.option("--florence", default="microsoft/Florence-2-base")
-@click.option("--wd", default="SmilingWolf/wd-v1-4-vit-tagger-v2")
+@click.option(
+    "--florence",
+    default="microsoft/Florence-2-base",
+    help="HF id OR local directory containing Florence-2 (config.json + weights)",
+)
+@click.option(
+    "--wd",
+    default="SmilingWolf/wd-v1-4-vit-tagger-v2",
+    help="HF id OR local directory containing model.onnx + selected_tags.csv",
+)
 @click.option("--threshold", default=0.35, type=float)
+@click.option(
+    "--local-files",
+    type=click.Choice(["auto", "only", "allow"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="auto=use disk if path is a local model dir; only=never hit Hub; allow=allow Hub download",
+)
 @click.pass_context
-def caption_cmd(ctx, image_ids, do_all, florence, wd, threshold):
-    """Run Florence-2 + WD tagger and store results."""
+def caption_cmd(ctx, image_ids, do_all, florence, wd, threshold, local_files):
+    """Run Florence-2 + WD tagger and store results.
+
+    Models are loaded ONCE then reused for every image.
+
+    Examples:
+      python -m ai_image_db.cli caption --all \
+        --florence /path/to/Florence-2-base \
+        --wd /path/to/wd-v1-4-vit-tagger-v2 \
+        --local-files only
+    """
     db = Database(ctx.obj["db_path"])
-    cap = Captioner(florence_model=florence, wd_model=wd, wd_threshold=threshold)
+    local_map = {"auto": None, "only": True, "allow": False}
+    cap = Captioner(
+        florence_model=florence,
+        wd_model=wd,
+        wd_threshold=threshold,
+        local_files_only=local_map[local_files.lower()],
+    )
 
     targets = list(image_ids)
     if do_all:
@@ -111,6 +141,9 @@ def audit_cmd(ctx, path, json_out):
         click.echo(f"File: {report['path']}")
         click.echo(f"  Machine-readable mark present : {art['machine_readable_mark_present']}")
         click.echo(f"  Human-visible label/signature : {art['human_visible_label_or_signature']}")
+        click.echo(f"  Visible overlay (OCR/badge)   : {art.get('visible_overlay_label_detected')}")
+        if art.get("visible_overlay_phrases"):
+            click.echo(f"  Overlay phrases               : {', '.join(art['visible_overlay_phrases'])}")
         c2 = report["c2pa"]
         click.echo(f"  C2PA manifest                 : {c2.get('has_manifest')} (valid={c2.get('is_valid')})")
         if c2.get("claim_generator"):

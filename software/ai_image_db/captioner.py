@@ -3,18 +3,64 @@ Captioning module using Florence-2 (narrative / prompt) and WD14-style tagger.
 
 Results are written into the `captions` table – derived from the *image*,
 not from any embedded original prompt.
+
+Supports:
+  - Local model directories (preferred when the path exists on disk)
+  - Hugging Face hub IDs as fallback
+  - Compatibility patch for Florence-2 + newer transformers
+    ('forced_bos_token_id' AttributeError)
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 from PIL import Image
 
-# Optional heavy imports are done lazily so the rest of the toolkit still works
-# without GPU / torch installed.
+
+def _is_local_model_dir(path: str | Path) -> bool:
+    p = Path(path)
+    if not p.is_dir():
+        return False
+    # Florence / HF-style dir usually has config.json; WD often has model.onnx
+    return (
+        (p / "config.json").exists()
+        or (p / "model.onnx").exists()
+        or (p / "selected_tags.csv").exists()
+        or any(p.glob("*.safetensors"))
+        or any(p.glob("*.bin"))
+    )
+
+
+def _patch_florence_config(model) -> None:
+    """
+    Newer transformers expect config.forced_bos_token_id during generate().
+    Florence-2 remote code configs sometimes omit it → AttributeError.
+    """
+    try:
+        cfg = getattr(model, "config", None)
+        if cfg is None:
+            return
+        # Top-level
+        if not hasattr(cfg, "forced_bos_token_id"):
+            bos = getattr(cfg, "bos_token_id", None)
+            try:
+                cfg.forced_bos_token_id = bos
+            except Exception:
+                pass
+        # Nested text_config (Florence2Config)
+        text_cfg = getattr(cfg, "text_config", None)
+        if text_cfg is not None and not hasattr(text_cfg, "forced_bos_token_id"):
+            bos = getattr(text_cfg, "bos_token_id", None) or getattr(cfg, "bos_token_id", None)
+            try:
+                text_cfg.forced_bos_token_id = bos
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Captioner] config patch warning: {e}")
 
 
 class Captioner:
@@ -24,15 +70,26 @@ class Captioner:
         wd_model: str = "SmilingWolf/wd-v1-4-vit-tagger-v2",
         device: Optional[str] = None,
         wd_threshold: float = 0.35,
+        local_files_only: Optional[bool] = None,
     ):
+        """
+        florence_model / wd_model: HF repo id OR absolute/relative local directory.
+
+        local_files_only:
+          - True  → never hit the Hub
+          - False → always allow Hub
+          - None  → auto: True when path is an existing local model dir
+        """
         self.florence_model_id = florence_model
         self.wd_model_id = wd_model
         self.wd_threshold = wd_threshold
-        self.device = device  # "cuda", "cpu", or None (auto)
+        self.device = device
+        self.local_files_only = local_files_only
         self._florence = None
         self._florence_processor = None
         self._wd_model = None
         self._wd_tags = None
+        self._wd_input_name = None
 
     # ------------------------------------------------------------------
     # Florence-2
@@ -45,23 +102,60 @@ class Captioner:
 
         device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
-        print(f"[Captioner] Loading Florence-2 ({self.florence_model_id}) on {device} …")
-        self._florence = AutoModelForCausalLM.from_pretrained(
-            self.florence_model_id,
-            trust_remote_code=True,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        ).to(device).eval()
-        self._florence_processor = AutoProcessor.from_pretrained(
-            self.florence_model_id, trust_remote_code=True
+
+        model_id = self.florence_model_id
+        is_local = _is_local_model_dir(model_id)
+        local_only = (
+            self.local_files_only if self.local_files_only is not None else is_local
         )
+
+        print(
+            f"[Captioner] Loading Florence-2 ({model_id}) on {device} "
+            f"(local_files_only={local_only}) …"
+        )
+
+        load_kwargs = {
+            "trust_remote_code": True,
+            "local_files_only": local_only,
+            "torch_dtype": torch.float16 if device == "cuda" else torch.float32,
+        }
+        # attn implementation can fail on some builds; leave default
+
+        try:
+            self._florence = AutoModelForCausalLM.from_pretrained(
+                model_id, **load_kwargs
+            ).to(device).eval()
+        except Exception as e:
+            # Common: transformers version mismatch with remote modeling code
+            print(f"[Captioner] Florence load failed: {e}")
+            print(
+                "[Captioner] Tip: try  pip install 'transformers>=4.41.0,<4.50'  "
+                "or use a Florence build whose modeling_*.py matches your transformers."
+            )
+            raise
+
+        self._florence_processor = AutoProcessor.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            local_files_only=local_only,
+        )
+        _patch_florence_config(self._florence)
 
     def _florence_task(self, image: Image.Image, task: str) -> str:
         self._load_florence()
         import torch
 
+        # Re-patch in case generate path re-reads config
+        _patch_florence_config(self._florence)
+
         inputs = self._florence_processor(
             text=task, images=image, return_tensors="pt"
-        ).to(self.device)
+        )
+        # Move tensors to device
+        inputs = {
+            k: v.to(self.device) if hasattr(v, "to") else v for k, v in inputs.items()
+        }
+
         with torch.no_grad():
             generated_ids = self._florence.generate(
                 input_ids=inputs["input_ids"],
@@ -78,62 +172,96 @@ class Captioner:
             task=task,
             image_size=(image.width, image.height),
         )
-        # parsed is usually {task: "caption text"}
         if isinstance(parsed, dict):
             return str(parsed.get(task, next(iter(parsed.values()), "")))
         return str(parsed)
 
     # ------------------------------------------------------------------
-    # WD14 / WD1.4 style tagger (ONNX preferred when available)
+    # WD14 tagger (local dir or HF)
     # ------------------------------------------------------------------
     def _load_wd(self):
         if self._wd_model is not None:
             return
-        # Prefer ONNX runtime path used by most modern WD taggers
         try:
             self._load_wd_onnx()
         except Exception as e:
-            print(f"[Captioner] ONNX WD load failed ({e}); falling back to a simple placeholder.")
+            print(f"[Captioner] ONNX WD load failed ({e}); tags will be empty.")
             self._wd_model = "placeholder"
             self._wd_tags = []
 
-    def _load_wd_onnx(self):
-        """
-        Load a WD14-style ONNX model from Hugging Face.
-        Common repos: SmilingWolf/wd-v1-4-vit-tagger-v2, wd-vit-tagger-v3, etc.
-        """
-        from huggingface_hub import hf_hub_download
-        import onnxruntime as ort
-        import pandas as pd
+    def _resolve_wd_files(self) -> tuple[Path, Path]:
+        """Return (model.onnx path, selected_tags.csv path)."""
+        root = Path(self.wd_model_id)
+        if _is_local_model_dir(root) or root.is_dir():
+            model_file = None
+            for name in ("model.onnx", "wd.onnx"):
+                cand = root / name
+                if cand.exists():
+                    model_file = cand
+                    break
+            if model_file is None:
+                found = list(root.glob("*.onnx"))
+                if found:
+                    model_file = found[0]
+            tags_file = None
+            for name in ("selected_tags.csv", "tags.csv"):
+                cand = root / name
+                if cand.exists():
+                    tags_file = cand
+                    break
+            if model_file is None or tags_file is None:
+                raise FileNotFoundError(
+                    f"Local WD dir {root} needs model.onnx and selected_tags.csv "
+                    f"(found model={model_file}, tags={tags_file})"
+                )
+            return model_file, tags_file
 
-        print(f"[Captioner] Loading WD tagger ({self.wd_model_id}) …")
-        # Try common file names
+        # Hugging Face hub
+        from huggingface_hub import hf_hub_download
+
         model_file = None
-        for name in ("model.onnx", "wd.onnx", "model.onnx"):
+        for name in ("model.onnx", "wd.onnx"):
             try:
-                model_file = hf_hub_download(self.wd_model_id, name)
+                model_file = Path(hf_hub_download(self.wd_model_id, name))
                 break
             except Exception:
                 continue
         if model_file is None:
-            # some repos ship under different structure
-            model_file = hf_hub_download(self.wd_model_id, "model.onnx")
+            model_file = Path(hf_hub_download(self.wd_model_id, "model.onnx"))
 
         tags_file = None
         for name in ("selected_tags.csv", "tags.csv"):
             try:
-                tags_file = hf_hub_download(self.wd_model_id, name)
+                tags_file = Path(hf_hub_download(self.wd_model_id, name))
                 break
             except Exception:
                 continue
         if tags_file is None:
             raise FileNotFoundError("Could not find selected_tags.csv for WD model")
+        return model_file, tags_file
 
-        self._wd_model = ort.InferenceSession(
-            model_file, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
+    def _load_wd_onnx(self):
+        import onnxruntime as ort
+        import pandas as pd
+
+        print(f"[Captioner] Loading WD tagger ({self.wd_model_id}) …")
+        model_file, tags_file = self._resolve_wd_files()
+        print(f"[Captioner]   onnx={model_file}")
+        print(f"[Captioner]   tags={tags_file}")
+
+        providers = []
+        try:
+            import torch
+            if torch.cuda.is_available():
+                providers.append("CUDAExecutionProvider")
+        except Exception:
+            pass
+        providers.append("CPUExecutionProvider")
+
+        self._wd_model = ort.InferenceSession(str(model_file), providers=providers)
+        self._wd_input_name = self._wd_model.get_inputs()[0].name
+
         df = pd.read_csv(tags_file)
-        # Standard WD CSV has columns: tag_id, name, category, count
         if "name" in df.columns:
             self._wd_tags = df["name"].tolist()
         else:
@@ -144,17 +272,12 @@ class Captioner:
         if self._wd_model == "placeholder":
             return []
 
-        # Preprocess to 448x448 (common for WD14)
         img = image.convert("RGB").resize((448, 448), Image.BICUBIC)
         arr = np.asarray(img, dtype=np.float32)
-        # WD models usually expect BGR and [0,255] or normalized; most ONNX
-        # export expect NHWC float32 in 0-255 BGR.
-        arr = arr[:, :, ::-1]  # RGB -> BGR
+        arr = arr[:, :, ::-1]  # RGB → BGR
         arr = np.expand_dims(arr, 0)
 
-        input_name = self._wd_model.get_inputs()[0].name
-        probs = self._wd_model.run(None, {input_name: arr})[0][0]
-
+        probs = self._wd_model.run(None, {self._wd_input_name: arr})[0][0]
         results = []
         for tag, score in zip(self._wd_tags, probs):
             if float(score) >= self.wd_threshold:
@@ -171,11 +294,8 @@ class Captioner:
 
         narrative = self._florence_task(image, "<MORE_DETAILED_CAPTION>")
         short = self._florence_task(image, "<CAPTION>")
-        # Prompt-style: ask Florence for a generation-oriented description
         try:
-            prompt_style = self._florence_task(
-                image, "<DETAILED_CAPTION>"
-            )  # slightly different prompt
+            prompt_style = self._florence_task(image, "<DETAILED_CAPTION>")
         except Exception:
             prompt_style = narrative
 
@@ -198,10 +318,6 @@ class Captioner:
         image_id: int,
         path: Optional[str | Path] = None,
     ) -> dict[str, Any]:
-        """
-        Run captioning and write results into the captions table.
-        If path is omitted, look up filepath from the DB.
-        """
         if path is None:
             row = db.get_image(image_id)
             if not row:
